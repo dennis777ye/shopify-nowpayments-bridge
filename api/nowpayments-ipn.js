@@ -61,3 +61,20 @@ export default async function handler(req, res) {
 
   return res.status(200).json({ ok: true });
 }
+export default async function handler(req, res) {
+  console.log("📦 Shopify Order Create request received:", {
+    method: req.method,
+    headers: req.headers,
+    body: req.body,
+  });
+
+  try {
+    // your existing logic here...
+
+    res.status(200).json({ success: true });
+  } catch (err) {
+    console.error("❌ Error in shopify-order-create:", err);
+    res.status(500).json({ error: err.message });
+  }
+}
+
