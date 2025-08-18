@@ -1,80 +1,122 @@
+// api/nowpayments-ipn.js
 import crypto from "node:crypto";
 import getRawBody from "raw-body";
 
-const NOW_IPN_SECRET       = process.env.NOWPAYMENTS_IPN_SECRET;
-const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN;
-const SHOPIFY_ACCESS_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
+export const config = {
+  api: { bodyParser: false }, // need raw for signature verification
+};
 
-// Sort object keys before HMAC (NOWPayments requirement)
+// ───────────────────────────────────────────────────────────────────────────────
+// NOWPayments signature verification
+// They require HMAC-SHA512 over a "key-sorted" JSON stringified body.
 function stringifySorted(obj) {
   const sortedKeys = Object.keys(obj).sort();
-  const sorted = {};
-  for (const k of sortedKeys) sorted[k] = obj[k];
-  return JSON.stringify(sorted);
+  const o = {};
+  for (const k of sortedKeys) o[k] = obj[k];
+  return JSON.stringify(o);
 }
 
-export const config = { api: { bodyParser: false } };
+function verifyNowpaymentsSig(rawBody, headerSig, ipnSecret) {
+  try {
+    const decoded = JSON.parse(rawBody);
+    const sortedStr = stringifySorted(decoded);
+    const expected = crypto
+      .createHmac("sha512", ipnSecret)
+      .update(sortedStr)
+      .digest("hex");
+    const safe =
+      typeof headerSig === "string" &&
+      crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(headerSig));
+    return safe;
+  } catch (e) {
+    return false;
+  }
+}
 
+// ───────────────────────────────────────────────────────────────────────────────
+async function tagShopifyOrder(orderId, tagToAdd) {
+  const domain = process.env.SHOPIFY_STORE_DOMAIN;
+  const token = process.env.SHOPIFY_ACCESS_TOKEN;
+
+  // Get current tags, then PUT the updated tag string
+  const getUrl = `https://${domain}/admin/api/2025-07/orders/${orderId}.json`;
+  const getRes = await fetch(getUrl, {
+    headers: { "X-Shopify-Access-Token": token },
+  });
+  const getText = await getRes.text();
+  console.log("[SHOPIFY GET ORDER] status:", getRes.status, "body:", getText);
+  const order = JSON.parse(getText)?.order;
+  const existingTags = order?.tags || "";
+  const set = new Set(
+    existingTags
+      .split(",")
+      .map((t) => t.trim())
+      .filter(Boolean)
+  );
+  set.add(tagToAdd);
+  const newTags = Array.from(set).join(", ");
+
+  const putUrl = `https://${domain}/admin/api/2025-07/orders/${orderId}.json`;
+  const putRes = await fetch(putUrl, {
+    method: "PUT",
+    headers: {
+      "X-Shopify-Access-Token": token,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ order: { id: orderId, tags: newTags } }),
+  });
+  const putText = await putRes.text();
+  console.log("[SHOPIFY TAG UPDATE] status:", putRes.status, "body:", putText);
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
 export default async function handler(req, res) {
-  if (req.method !== "POST") return res.status(405).end();
+  if (req.method !== "POST") {
+    console.log("[NP IPN] Non-POST hit:", req.method);
+    return res.status(405).end("Method Not Allowed");
+  }
+
+  const ipnSecret = process.env.NOWPAYMENTS_IPN_SECRET;
+  if (!ipnSecret) {
+    console.error("[NP IPN] Missing NOWPAYMENTS_IPN_SECRET");
+    return res.status(500).end("Server not configured");
+  }
 
   const raw = (await getRawBody(req)).toString("utf8");
-  const ipnData = JSON.parse(raw);
+  const sigHeader = req.headers["x-nowpayments-sig"];
 
-  const signature = req.headers["x-nowpayments-sig"];
-  const signedStr = stringifySorted(ipnData);
-  const expected = crypto.createHmac("sha512", NOW_IPN_SECRET).update(signedStr).digest("hex");
-
-  if (expected !== signature) {
-    return res.status(401).send("Bad IPN signature");
+  // Verify signature
+  const valid = verifyNowpaymentsSig(raw, sigHeader, ipnSecret);
+  if (!valid) {
+    console.warn("[NP IPN] Invalid signature");
+    return res.status(401).end("Invalid signature");
   }
 
-  const status = (ipnData.payment_status || ipnData.status || "").toLowerCase();
-  if (!["confirmed", "finished"].includes(status)) {
-    return res.status(200).send("No action");
+  const ipn = JSON.parse(raw);
+  console.log("[NP IPN] Payload:", ipn);
+
+  // NOWPayments usually echoes your order_id back—ensure we have it
+  const orderId = ipn.order_id || ipn.orderId || ipn.order?.id;
+  if (!orderId) {
+    console.warn("[NP IPN] Missing order_id");
+    return res.status(200).end("ok");
   }
 
-  const shopifyIdNumeric = String(ipnData.order_id);
-  const orderGID = `gid://shopify/Order/${shopifyIdNumeric}`;
-
-  const query = `
-    mutation orderMarkAsPaid($input: OrderMarkAsPaidInput!) {
-      orderMarkAsPaid(input: $input) {
-        userErrors { field message }
-        order { id displayFinancialStatus }
-      }
-    }`;
-
-  const resp = await fetch(`https://${SHOPIFY_STORE_DOMAIN}/admin/api/2025-07/graphql.json`, {
-    method: "POST",
-    headers: {
-      "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({ query, variables: { input: { id: orderGID } } })
-  });
-
-  const data = await resp.json();
-  if (data?.data?.orderMarkAsPaid?.userErrors?.length) {
-    console.error("orderMarkAsPaid errors:", data.data.orderMarkAsPaid.userErrors);
-  }
-
-  return res.status(200).json({ ok: true });
-}
-export default async function handler(req, res) {
-  console.log("📦 Shopify Order Create request received:", {
-    method: req.method,
-    headers: req.headers,
-    body: req.body,
-  });
+  // Payment state machine: paid = confirmed/finished
+  const status = (ipn.payment_status || ipn.paymentStatus || "").toLowerCase();
+  console.log("[NP IPN] status:", status, "order:", orderId);
 
   try {
-    // your existing logic here...
-
-    res.status(200).json({ success: true });
-  } catch (err) {
-    console.error("❌ Error in shopify-order-create:", err);
-    res.status(500).json({ error: err.message });
+    if (status === "confirmed" || status === "finished") {
+      await tagShopifyOrder(orderId, "crypto_paid");
+    } else if (status === "partially_paid") {
+      await tagShopifyOrder(orderId, "crypto_partially_paid");
+    } else if (status === "failed" || status === "refunded" || status === "expired") {
+      await tagShopifyOrder(orderId, `crypto_${status}`);
+    }
+  } catch (e) {
+    console.error("[NP IPN] Error updating Shopify:", e);
   }
-}
 
+  return res.status(200).end("ok");
+}
