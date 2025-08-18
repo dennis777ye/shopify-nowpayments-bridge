@@ -1,0 +1,8 @@
+{
+  "name": "shopify-nowpayments-bridge",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "raw-body": "^3.0.0"
+  }
+}
